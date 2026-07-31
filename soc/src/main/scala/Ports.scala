@@ -11,14 +11,16 @@ import testchipip.spi.{SPIChipIO}
 import testchipip.cosim.{TraceOutputTop, SpikeCosimConfig}
 import testchipip.iceblk.{BlockDeviceIO, BlockDeviceConfig}
 import testchipip.tsi.{UARTTSIIO}
+import testchipip.ctc.{CTCBridgeIO}
 import icenet.{NICIOvonly, NICConfig}
 import org.chipsalliance.cde.config.{Parameters}
 import freechips.rocketchip.amba.axi4.{AXI4Bundle, AXI4EdgeParameters}
 import freechips.rocketchip.subsystem.{MemoryPortParams, MasterPortParams, SlavePortParams}
 import freechips.rocketchip.devices.debug.{ClockedDMIIO}
-import freechips.rocketchip.util.{HeterogeneousBag}
 import freechips.rocketchip.tilelink.{TLBundle}
-import rose.{RosePortIO, RoseAdapterParams}
+import org.chipsalliance.diplomacy.nodes.{HeterogeneousBag}
+// RoSE: shared bridge port/param types live in firechip.bridgeinterfaces (chisel6 bridge-stub split)
+import firechip.bridgeinterfaces.{RosePortIO, CompleteDataflowConfig, RoseAdapterParams}
 
 trait Port[T <: Data] {
   val getIO: () => T
@@ -110,5 +112,15 @@ case class JTAGResetPort   (val getIO: () => Reset)
 case class TLMemPort       (val getIO: () => HeterogeneousBag[TLBundle])
     extends Port[HeterogeneousBag[TLBundle]]
 
+case class GCDBusyPort     (val getIO: () => Bool)
+    extends Port[Bool]
+
+case class OffchipSelPort  (val getIO: () => UInt)
+    extends Port[UInt]
+
+case class CTCPort (val getIO: () => Data, val portId: Int)
+    extends Port[Data]
+
+// RoSE co-sim adapter port
 case class RoseAdapterPort    (val getIO: () => ClockedIO[RosePortIO], val params: RoseAdapterParams)
     extends Port[ClockedIO[RosePortIO]]

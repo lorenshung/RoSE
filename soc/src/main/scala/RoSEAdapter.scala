@@ -4,9 +4,9 @@ import chisel3._
 import chisel3.util._
 // import testchipip._
 import testchipip.util.{ClockedIO}
-import chisel3.experimental.{IO, IntParam, BaseModule}
+import chisel3.experimental.{IntParam, BaseModule}
 import freechips.rocketchip.prci._
-import freechips.rocketchip.subsystem.{BaseSubsystem, CacheBlockBytes}
+import freechips.rocketchip.subsystem.{BaseSubsystem, CacheBlockBytes, FBUS, PBUS}
 import org.chipsalliance.cde.config.{Parameters, Field, Config}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.regmapper._
@@ -14,6 +14,8 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util.UIntIsOneOf
 import freechips.rocketchip.interrupts._
 // import testchipip.TLHelper
+
+import firechip.bridgeinterfaces.{RosePortIO, RoseAdapterParams, DstParams_Container, DstParams, CompleteDataflowConfig}
 
 // buffers non-DMA data and tx data
 class RoseAdapterMMIOChiselModule(params: RoseAdapterParams) extends Module
@@ -25,7 +27,7 @@ class RoseAdapterMMIOChiselModule(params: RoseAdapterParams) extends Module
   io.tx.deq <> txfifo.io.deq
 
   for (i <- 0 until params.dst_ports.seq.count(_.port_type != "DMA")) {
-    val rx_buffer_fifo = Module(new Queue(UInt(params.width.W), 8)) 
+    val rx_buffer_fifo = Module(new Queue(UInt(params.width.W), 8))
     rx_buffer_fifo.io.enq <> io.rx.enq(i)
     rx_buffer_fifo.io.deq <> io.rx.deq(i)
   }
@@ -135,6 +137,8 @@ trait CanHavePeripheryRoseAdapter { this: BaseSubsystem =>
   val roseio = p(RoseAdapterKey) match { 
     case Some(params) => {
       // generate the lazymodule with regmap
+      val fbus = locateTLBusWrapper(FBUS)
+      val pbus = locateTLBusWrapper(PBUS)
       val roseAdapterTL = LazyModule(new RoseAdapterTL(params, pbus.beatBytes)(p))
       roseAdapterTL.clockNode := pbus.fixedClockNode
       pbus.coupleTo("RoseAdapter") { roseAdapterTL.node := TLFragmenter(pbus.beatBytes, pbus.blockBytes) := _ }

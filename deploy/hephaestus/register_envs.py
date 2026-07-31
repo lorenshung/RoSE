@@ -1,7 +1,9 @@
 from gymnasium.envs.registration import register
-from envs.airsim import airsim_gym 
-#import envs.customized_env.LQR_gym_env as LQR_gym_env
-from envs.mujoco import inverted_pendulum_fine_v4
+# NOTE: registration uses string entry_points (lazy import), so we do NOT eagerly
+# import the env modules here. This keeps loading the synchronizer dependency-light:
+# optional envs (airsim -> needs `airsim`; mujoco -> needs `gymnasium[mujoco]`) are
+# only imported if you actually gym.make() them. Dummy envs (MiddleBury/LQR) need
+# only numpy + opencv.
 
 import gymnasium as gym
 
@@ -30,4 +32,23 @@ register(
 register(
     id='MiddleBuryEnv-v0',
     entry_point='envs.middlebury.middlebury:MiddleBuryEnv',
+)
+
+# Known-pattern no-simulator env for bridge RX validation
+register(
+    id='PatternEnv-v0',
+    entry_point='envs.pattern.pattern_env:PatternEnv',
+)
+
+# gym-pybullet-drones quadrotor: serves IMU state over the bridge, consumes motor RPMs
+register(
+    id='PyBulletDroneEnv-v0',
+    entry_point='envs.pybullet_drone.drone_env:PyBulletDroneEnv',
+)
+
+# gym-pybullet-drones quadrotor for the TinyMPC drone_control loop: serves the full
+# 12-DoF linearized state and consumes 4 normalized motor thrusts (closed-loop control).
+register(
+    id='PyBulletDroneMPCEnv-v0',
+    entry_point='envs.pybullet_drone.drone_mpc_env:PyBulletDroneMPCEnv',
 )

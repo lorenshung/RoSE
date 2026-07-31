@@ -1,0 +1,27 @@
+# Unified RoSE bridge-test config: serves the known PatternEnv pattern on TWO routes so a
+# single synchronizer config drives every samples/rose test:
+#   cmd 0x11 -> channel 0 (DMA0, CamDMAEngine -> mem 0x88000000)   [dma / selftest]
+#   cmd 0x12 -> channel 2 (reqrsp1, ROSE_RX_DATA_2, MMIO read)     [reqrsp / protocol / selftest]
+packets:
+  - name: camera_dma
+    id: 0x11
+    type: "reqrsp"
+    latency: 0
+    channel: 0
+    indices:
+      - "pattern"
+  - name: data_reqrsp
+    id: 0x12
+    type: "reqrsp"
+    latency: 0
+    channel: 2
+    indices:
+      - "pattern"
+
+# bandwidth_threshold = cycles BETWEEN word deliveries (0 = unlimited).
+channel_bandwidth: [[0, 0, 0]]
+
+gym_timestep: 0.001
+gym_kwargs: {}
+n_gym_agents: 1
+n_fsim_nodes: 1
