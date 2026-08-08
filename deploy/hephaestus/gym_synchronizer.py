@@ -7,14 +7,21 @@ import register_envs
 from utils.logger import GymLogger
 import time
 import datetime
+import faulthandler
+import threading
 import numpy as np
 import os
+import sys
 import yaml
+import zlib
 from functools import reduce
 
-HOST = "localhost"
-SYNC_PORT = 10001
-DATA_PORT = 60002
+# Port/host are env-overridable so multiple co-sim cells can run in parallel on one host
+# (each on its own port). The parallel stress harness sets ROSE_SYNC_PORT per cell and
+# passes the matching --rose-port to rose_spike_sim. Defaults preserve the single-run flow.
+HOST = os.environ.get("ROSE_SYNC_HOST", "localhost")
+SYNC_PORT = int(os.environ.get("ROSE_SYNC_PORT", "10001"))
+DATA_PORT = int(os.environ.get("ROSE_DATA_PORT", "60002"))
 
 class CONTROL_HEADERS:
     # fsim->gym
@@ -65,12 +72,24 @@ class DummySynchronizer:
         with open(os.path.join(script_dir, '../config/config_deploy_gym.yaml'), 'r') as f:
             config = yaml.safe_load(f)
             gym_env = config.get('gym_env', 'AirSimEnv-v0')  # Default to 'AirSimEnv-v0' if not found
+        # Env-var override so a run can select a different env (e.g. the multisensor nav env)
+        # without editing the committed config_deploy_gym.yaml default.
+        gym_env = os.environ.get('ROSE_GYM_ENV', gym_env)
         
         # Load timing information from the config
         if 'firesim_step' in config:
             self.firesim_step = config['firesim_step']
         if 'firesim_freq' in config:
             self.firesim_freq = config['firesim_freq']
+        # Env overrides so the stress harness can model a slower SoC clock (fewer cycles/step
+        # for spike to functionally simulate -> faster wall clock) WITHOUT editing the
+        # committed 1 GHz demo default. Keep firesim_step/firesim_freq == the same period so
+        # the control rate (gym_timestep) is unchanged; only shrink both to cut the per-step
+        # cycle budget down toward (but above) the TinyMPC solve cost.
+        if os.environ.get('ROSE_FIRESIM_STEP'):
+            self.firesim_step = int(os.environ['ROSE_FIRESIM_STEP'])
+        if os.environ.get('ROSE_FIRESIM_FREQ'):
+            self.firesim_freq = int(os.environ['ROSE_FIRESIM_FREQ'])
         if 'max_sim_time' in config:
             self.cycle_limit = config['max_sim_time'] * self.firesim_freq
         if 'render' in config:
@@ -185,11 +204,63 @@ class Synchronizer(DummySynchronizer):
         self.done = None
         print(f"Using firesim step: {self.firesim_step}, firesim freq: {self.firesim_freq}, gym timestep: {self.gym_timestep}, gym step per firesim step: {self.gym_step_per_firesim_step}")
 
+    def _start_stall_watchdog(self):
+        """Daemon thread that flags a stalled co-sim step and dumps thread stacks.
+
+        Normal env.step() takes ~0.1-0.4 s; a render/reset a few seconds. A stall of
+        tens of seconds means a hang. On stall we print the step it froze at and call
+        faulthandler.dump_traceback(all_threads=True) so the stuck frame is unambiguous:
+          - a frame in env.step / isaac / physx  -> Isaac/PhysX side (SoC is idle & fine)
+          - a frame in check_token_exhaustion / get_firesim_cycles -> waiting on SoC ack
+        Enabled by default; tune/disable via ROSE_SYNC_WATCHDOG_S (0 disables).
+        """
+        try:
+            timeout_s = float(os.environ.get("ROSE_SYNC_WATCHDOG_S", "45"))
+        except ValueError:
+            timeout_s = 45.0
+        if timeout_s <= 0:
+            return
+
+        def _watch():
+            last_count = -1
+            last_change = time.time()
+            fired_for = -1
+            while True:
+                time.sleep(min(5.0, timeout_s / 2.0))
+                if getattr(self, "done", False):
+                    return
+                c = getattr(self, "count", 0)
+                now = time.time()
+                if c != last_count:
+                    last_count = c
+                    last_change = now
+                    continue
+                # count has not advanced; check how long
+                if now - last_change >= timeout_s and c != fired_for:
+                    fired_for = c
+                    print(f"\n[SYNC WATCHDOG] co-sim step frozen at count={c} for "
+                          f"{now - last_change:.0f}s — dumping thread stacks to locate "
+                          f"the stall (env.step=Isaac side; check_token_exhaustion/"
+                          f"get_firesim_cycles=waiting on SoC ack):", flush=True)
+                    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+                    sys.stderr.flush()
+
+        t = threading.Thread(target=_watch, name="sync-stall-watchdog", daemon=True)
+        t.start()
+
     def run(self):
         # Start running threads for each RTL simulator
         for socket_thread in self.nodes:
             socket_thread.start()
         self.start_time = time.time()
+
+        # Stall watchdog: the co-sim occasionally hangs (guest idle at 0% CPU, sync
+        # pinned busy). To attribute it — Isaac env.step() vs the SoC-ack busy-spin in
+        # check_token_exhaustion()/get_firesim_cycles() — a daemon thread watches step
+        # progress and, if self.count stops advancing for ROSE_SYNC_WATCHDOG_S seconds,
+        # dumps every thread's Python stack (which pins the exact stuck line). Diagnostic
+        # only: it never touches control flow, so normal runs are unaffected.
+        self._start_stall_watchdog()
 
         # Initialize the logger
         log_dir = f'{os.path.dirname(os.path.abspath(__file__))}/logs'
@@ -291,7 +362,7 @@ class Synchronizer(DummySynchronizer):
                 print("Terminated due to completing objective!")
             
             # Close all connections to simulators
-            for socket_thread in self.socket_threads:
+            for socket_thread in self.nodes:
                 socket_thread.kill()
             
             # terminate simulation
@@ -314,11 +385,32 @@ class Synchronizer(DummySynchronizer):
         packet = Control_Packet(CONTROL_HEADERS.CS_GRANT_TOKEN, 0, None)
         target_thread.txqueue.append(packet)
 
+    def _bridge_disconnected_shutdown(self, target_thread):
+        """The bridge (spike) closed the socket — co-sim over (spike exit / timeout /
+        crash). Shut down cleanly instead of busy-spinning a core on a dead peer forever
+        (the sync-side mirror of the spike's own disconnect-exit)."""
+        print(f"[SYNC] bridge closed the connection at step {self.count} — co-sim ended; "
+              f"shutting down (was waiting on a SoC ack that will never come).", flush=True)
+        try:
+            self.logger.close()
+        except Exception:
+            pass
+        for st in self.nodes:
+            st.kill()
+        # Hard exit: sys.exit() only unwinds the main thread and then blocks waiting for
+        # Isaac's many non-daemon background threads to join (they never do), leaving the
+        # process alive and spinning. os._exit terminates now — the co-sim is over.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+
     def check_token_exhaustion(self, target_thread):
         while True:
             if len(target_thread.sync_rxqueue) > 0:
                 target_thread.sync_rxqueue.pop(0)
                 break
+            if target_thread.disconnected:
+                self._bridge_disconnected_shutdown(target_thread)
 
     def retrieve_obs_push_packet(self, cmd, target_thread, packet_config):
         if packet_config['indices'] is not None:
@@ -341,12 +433,43 @@ class Synchronizer(DummySynchronizer):
                 packet = Payload_Packet(cmd, len(row_packet_arr) * 4, row_packet_arr)  # You might need to adjust the multiplier
                 stable_heap_push(target_thread.txpq, packet)
 
+    def retrieve_obs_push_dma_frame(self, cmd, target_thread, packet_config):
+        """Serve a large sensor frame (e.g. the HM01B0 FPV camera) over the DMA channel.
+
+        The bridge's DMA engine memcpy's ONE served payload into guest DRAM at dma_base and
+        raises the completion IRQ (see rose_spike_sim.cc deliver() ch0). So — unlike a 2D
+        camera served row-per-packet on a reqrsp channel — a DMA frame MUST be a single
+        contiguous payload, or successive packets would overwrite the same dma_base. We
+        require a 1-D obs (flat frame) and emit exactly one Payload_Packet. Routing (cmd ->
+        channel 0) is already configured via send_route() at startup.
+
+        Logs the served frame's CRC32 (== Zephyr crc32_ieee on the guest) + byte length so the
+        co-sim can confirm the exact frame landed intact on the SoC."""
+        obs_data = self.obs
+        for idx in (packet_config['indices'] or []):
+            obs_data = obs_data[idx]
+        obs_data = np.ascontiguousarray(obs_data)
+        if obs_data.ndim != 1:
+            raise ValueError("DMA frame '%s' must be a flat 1-D array (got shape %s); a DMA "
+                             "payload is a single contiguous transfer" % (packet_config.get('name'), obs_data.shape))
+        raw = obs_data.tobytes()
+        if len(raw) % 4 != 0:
+            raise ValueError("DMA frame '%s' byte length %d not a multiple of 4 (word packing)"
+                             % (packet_config.get('name'), len(raw)))
+        packet_arr = np.frombuffer(raw, dtype=np.uint32).tolist()
+        packet = Payload_Packet(cmd, len(packet_arr) * 4, packet_arr)
+        stable_heap_push(target_thread.txpq, packet)
+        crc = zlib.crc32(raw) & 0xffffffff
+        print("[dma-serve] cmd=0x%02x '%s' nbytes=%d crc32=0x%08x"
+              % (cmd, packet_config.get('name'), len(raw), crc), flush=True)
+
     def get_firesim_cycles(self, target_thread):
         packet = Control_Packet(CONTROL_HEADERS.CS_REQ_CYCLES, 0, None)
         target_thread.txqueue.append(packet)
 
         while len(target_thread.sync_rxqueue) == 0:
-            pass
+            if target_thread.disconnected:
+                self._bridge_disconnected_shutdown(target_thread)
         response = target_thread.sync_rxqueue.pop(0)
         return response.data[0]
 
@@ -387,6 +510,10 @@ class Synchronizer(DummySynchronizer):
         # Retrieve observation related to the packet name
         if packet_config['type'] == 'reqrsp':
             self.retrieve_obs_push_packet(cmd, target_thread, packet_config)
+
+        # Large frames over the DMA channel (camera): single contiguous payload -> ch0 DMA.
+        if packet_config['type'] == 'dma':
+            self.retrieve_obs_push_dma_frame(cmd, target_thread, packet_config)
 
         if packet_config['type'] == 'stream':
             assert packet.num_bytes == 4, "Stream packets must be 4 bytes"

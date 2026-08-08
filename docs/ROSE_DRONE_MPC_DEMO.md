@@ -39,7 +39,7 @@ is exactly what RoSÉ exists to expose.
 
 Repo legend: **[R]** = `ucb-bar/RoSE` (`chipyard-top`) · **[X]** = `ucb-bar/XPU-RT`
 submodule (`dev`) · **[Z]** = `ucb-bar/zephyr-chipyard-sw` nested submodule
-(`rose-bridge-samples`) · **[T]** = `ucb-bar/Accelerated-TinyMPC` (nested in Z).
+(`rose-2-dev`) · **[T]** = `ucb-bar/Accelerated-TinyMPC` (nested in Z).
 
 ### Physics side — simulator, environment, synchronizer
 | Component | Path | Repo |
@@ -206,6 +206,17 @@ soc/sim/run_spike_rose.sh soc/sim/zephyr_rose_builds/drone_control/zephyr/zephyr
 This uses the passive `--extlib` plugin (`librose_spike.so`) instead of the lockstep
 harness. It preserves transaction ordering but not cycle timing, so it will not reproduce
 the clock-sweep result above.
+
+## 7b. IsaacLab (Isaac Sim) variant — same loop, different physics
+
+The identical guest, bridge, and loop wiring also fly a Bitcraze **Crazyflie** in NVIDIA
+Isaac Sim via `IsaacCrazyflieMPCEnv-v0` — only the `gym_env` id changes. It serves the same
+12-DoF target-relative state and consumes the same 4 per-motor thrusts (applied as per-rotor
+forces on the propeller bodies, matching TinyMPC's per-motor output). It needs the Isaac Sim
+toolchain (the same IsaacLab version pinned at `soc/sw/xpu-rt/sims/IsaacLab`); run the
+synchronizer with an Isaac-capable Python (e.g. the `env_isaaclab` conda env). Setup, the
+per-rotor model, and the validated hover result (z 0.50 → settles 1.02 at 1 GHz) are in
+[`deploy/hephaestus/envs/isaac_crazyflie/README.md`](../deploy/hephaestus/envs/isaac_crazyflie/README.md).
 
 ---
 

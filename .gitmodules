@@ -8,3 +8,9 @@
 [submodule "soc/sw/xpu-rt"]
 	path = soc/sw/xpu-rt
 	url = git@github.com:lorenshung/XPU-RT.git
+# Consumed read-only from upstream until a lorenshung/zephyr-rose fork exists;
+# https rather than ssh so a clone needs no key. The Zephyr-side copy of this
+# module is resolved by zephyr-chipyard-sw/west.yml, which tracks rose-2-dev.
+[submodule "soc/sw/zephyr-rose"]
+	path = soc/sw/zephyr-rose
+	url = https://github.com/ucb-bar/zephyr-rose.git

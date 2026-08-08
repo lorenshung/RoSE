@@ -57,6 +57,10 @@ static const uint32_t ST_RX2_VALID = 1u << 1; /* channel 2 */
 static const uint32_t ST_RX1_VALID = 1u << 2; /* channel 1 */
 static const uint32_t ST_DMA0_DONE = 1u << 3;
 
+/* Spike sparse-memory page granule (mem_t allocates per 4 KB page; addr_to_mem() returns a
+ * pointer valid only within one page). DMA writes must be chunked to this. */
+static const reg_t ROSE_PGSIZE = 4096;
+
 /* ---------------------------------------------------------------------------
  * rose_bridge_ctrl: protocol + regmap state. Owns the synchronizer socket and
  * all bridge state; the harness (rose_sim_t) drives its step-boundary hooks and
@@ -127,6 +131,9 @@ public:
 
 	bool take_grant() { if (pending_grant) { pending_grant = false; return true; } return false; }
 	uint32_t cycle_budget() const { return step_size; }
+	/* The synchronizer has closed the socket (run over / crashed). Lets the harness
+	 * shut down instead of orphaning and busy-spinning a core until its wall-clock timeout. */
+	bool sync_gone() const { return client.peer_closed(); }
 
 	/* End of a granted step: the guest has already streamed its requests to the
 	 * synchronizer as it ran; ack so the synchronizer serves the responses. */
@@ -177,8 +184,7 @@ private:
 		int ch = route_for(p.cmd);
 		RDBG("deliver cmd=0x%x nwords=%zu -> ch%d\n", p.cmd, p.data.size(), ch);
 		if (ch == 0) {
-			char *mem = static_cast<simif_t *>(sim)->addr_to_mem(dma_base);
-			if (mem) memcpy(mem, p.data.data(), p.data.size() * 4);
+			dma_write(dma_base, (const uint8_t *)p.data.data(), p.data.size() * 4);
 			dma_done = true;
 			set_irq(true);
 		} else {
@@ -191,6 +197,27 @@ private:
 	int route_for(uint32_t cmd) {
 		auto it = routes.find(cmd);
 		return (it != routes.end()) ? it->second : 2;
+	}
+
+	/* Write a DMA payload into guest DRAM at `addr`. Spike's mem_t is SPARSE (a per-page
+	 * host allocation, see devices.h sparse_memory_map), so addr_to_mem() returns a pointer
+	 * valid for only ONE page. A single memcpy across pages runs off the page into unrelated
+	 * host heap (heap corruption for frames > 4 KB, e.g. a camera frame). Copy page by page,
+	 * re-resolving addr_to_mem() for each page. Stops cleanly if a page is unmapped. */
+	void dma_write(reg_t addr, const uint8_t *src, size_t nbytes) {
+		size_t off = 0;
+		while (off < nbytes) {
+			char *mem = static_cast<simif_t *>(sim)->addr_to_mem(addr + off);
+			if (!mem) {
+				RDBG("dma_write: unmapped at 0x%llx after %zu/%zu bytes\n",
+				     (unsigned long long)(addr + off), off, nbytes);
+				break;
+			}
+			size_t page_left = ROSE_PGSIZE - ((size_t)(addr + off) & (ROSE_PGSIZE - 1));
+			size_t chunk = (nbytes - off < page_left) ? (nbytes - off) : page_left;
+			memcpy(mem, src + off, chunk);
+			off += chunk;
+		}
 	}
 
 	void set_irq(bool level) {
@@ -256,12 +283,15 @@ public:
 		   const std::vector<std::string> &htif_args,
 		   const debug_module_config_t &dm_config,
 		   reg_t rbase, uint32_t rirq, reg_t rdma, int nreqrsp, int ndma,
-		   const char *rhost, int rport)
+		   const char *rhost, int rport,
+		   const char *commitlog_path, uint64_t clog_start, uint64_t clog_end)
 		: sim_t(cfg, /*halted*/false, std::move(mems),
 			/*plugin_devices*/{}, htif_args, dm_config,
-			/*log_path*/nullptr, /*dtb_enabled*/true, /*dtb_file*/nullptr,
+			/*log_path*/commitlog_path, /*dtb_enabled*/true, /*dtb_file*/nullptr,
 			/*socket_enabled*/false, /*cmd_file*/nullptr, /*insn_limit*/std::nullopt),
-		  ctrl(this, rbase, rirq, rdma, nreqrsp, ndma, rhost, rport) {
+		  ctrl(this, rbase, rirq, rdma, nreqrsp, ndma, rhost, rport),
+		  commitlog_enabled(commitlog_path != nullptr),
+		  commit_step_start(clog_start), commit_step_end(clog_end) {
 		add_device(rbase, std::make_shared<rose_mmio_device_t>(&ctrl));
 	}
 
@@ -271,9 +301,28 @@ public:
 
 		ctrl.pump();  /* connect + deliver served data + latch config/grant */
 
+		/* If the synchronizer has gone away, stop — don't orphan and pin a core
+		 * busy-spinning idle() until the wall-clock timeout (that accumulation of
+		 * grantless spinners is a real host-load hazard across many co-sim runs). */
+		if (ctrl.sync_gone()) {
+			fprintf(stderr, "[rose_sim] synchronizer closed the connection at step=%llu -> exit\n",
+			        (unsigned long long)step_count);
+			exit(0);
+		}
+
 		if (!grant_active) {
 			if (!ctrl.take_grant()) return;   /* no grant yet -> machine stays frozen */
 			grant_active   = true;
+			/* Commit-log window: enable Spike's per-instruction commit log on the
+			 * boot hart once the co-sim reaches step commit_step_start, so the trace
+			 * covers a targeted window (e.g. the steps around a hang) instead of the
+			 * whole multi-billion-instruction run. Writes go to the log file passed
+			 * as log_path at construction. See ROSE_SPIKE_COMMITLOG in main(). */
+			if (commitlog_enabled && !commit_active && step_count >= commit_step_start) {
+				get_core((size_t)0)->enable_log_commits();
+				commit_active = true;
+				RDBG("commit-log ON at step=%llu\n", (unsigned long long)step_count);
+			}
 			uint32_t budget = ctrl.cycle_budget();
 			/* mtime advances 1 per INSNS_PER_RTC_TICK cycles; convert the cycle
 			 * budget to a global mtime delta (multicore-safe). */
@@ -293,6 +342,25 @@ public:
 			uint32_t spent = (uint32_t)((mtime_now() - step_start_mt) * INSNS_PER_RTC_TICK);
 			ctrl.ack_step(spent);
 			grant_active = false;
+			step_count++;
+			/* Bound the trace: once past the requested end step, flush the commit
+			 * log and stop, so the capture stays a manageable size. end==0 => no
+			 * upper bound (log start..end-of-run). */
+			if (commitlog_enabled && commit_active && commit_step_end != 0 &&
+			    step_count > commit_step_end) {
+				FILE *lf = get_core((size_t)0)->get_log_file();
+				if (lf) fflush(lf);
+				RDBG("commit-log window done at step=%llu -> stop\n",
+				     (unsigned long long)step_count);
+				exit(0);
+			}
+			/* Clean bounded stop (both builds). exit() flushes stdio, so an
+			 * in-progress TACIT tacit.out / commit log is written out intact. */
+			if (max_steps != 0 && step_count >= max_steps) {
+				RDBG("reached max_steps=%llu -> stop\n",
+				     (unsigned long long)max_steps);
+				exit(0);
+			}
 		}
 	}
 
@@ -303,6 +371,13 @@ private:
 	bool grant_active = false;
 	uint64_t budget_target = 0;
 	uint64_t step_start_mt = 0;
+	bool commitlog_enabled = false;
+	bool commit_active = false;
+	uint64_t commit_step_start = 0;
+	uint64_t commit_step_end = 0;
+	uint64_t step_count = 0;
+public:
+	uint64_t max_steps = 0;   /* 0 = unbounded; else clean-stop after N steps */
 };
 
 /* ---------------------------------------------------------------------------
@@ -358,11 +433,43 @@ int main(int argc, char **argv) {
 	auto mems = make_mems(cfg.mem_layout);
 	debug_module_config_t dm_config;
 
-	rose_sim_t s(&cfg, mems, htif_args, dm_config,
-		     rbase, rirq, rdma, nreqrsp, ndma, rhost, rport);
+	/* Commit-log (instruction-level SoC trace during the live lockstep):
+	 *   ROSE_SPIKE_COMMITLOG=<path>          enable, write Spike commit log to <path>
+	 *   ROSE_SPIKE_COMMITLOG_START=<step>    begin logging at this co-sim step (default 0)
+	 *   ROSE_SPIKE_COMMITLOG_END=<step>      stop the sim after this step (default 0 = run to end)
+	 * Targeted windows keep the trace small — e.g. START just before a suspected hang. */
+	const char *commitlog_path = getenv("ROSE_SPIKE_COMMITLOG");
+	uint64_t clog_start = 0, clog_end = 0;
+	if (const char *v = getenv("ROSE_SPIKE_COMMITLOG_START")) clog_start = strtoull(v, nullptr, 0);
+	if (const char *v = getenv("ROSE_SPIKE_COMMITLOG_END"))   clog_end   = strtoull(v, nullptr, 0);
+	if (commitlog_path && clog_end == 0) {
+		/* Each co-sim step is millions of retired instructions (~5M -> ~5M trace
+		 * lines / ~350 MB per step). Unbounded logging can fill the disk. */
+		fprintf(stderr, "[rose_sim] WARNING: ROSE_SPIKE_COMMITLOG has no _END step "
+		        "(unbounded, ~350MB/step). For hang-debug set a 1-step window, e.g. "
+		        "ROSE_SPIKE_COMMITLOG_START=N ROSE_SPIKE_COMMITLOG_END=N.\n");
+	}
 
-	RDBG("rose_spike_sim: nprocs=%zu rose@0x%lx irq=%u dma=0x%lx sync=%s:%d\n",
-	     nprocs, (unsigned long)rbase, rirq, (unsigned long)rdma, rhost, rport);
+	rose_sim_t s(&cfg, mems, htif_args, dm_config,
+		     rbase, rirq, rdma, nreqrsp, ndma, rhost, rport,
+		     commitlog_path, clog_start, clog_end);
+	/* ROSE_SPIKE_MAX_STEPS: clean-stop the co-sim after N physics steps (0 = unbounded).
+	 * Useful to bound a TACIT/commit-log capture so it flushes and stays small. */
+	if (const char *v = getenv("ROSE_SPIKE_MAX_STEPS")) s.max_steps = strtoull(v, nullptr, 0);
+
+	RDBG("rose_spike_sim: nprocs=%zu rose@0x%lx irq=%u dma=0x%lx sync=%s:%d commitlog=%s[%llu:%llu]\n",
+	     nprocs, (unsigned long)rbase, rirq, (unsigned long)rdma, rhost, rport,
+	     commitlog_path ? commitlog_path : "off",
+	     (unsigned long long)clog_start, (unsigned long long)clog_end);
+
+#ifdef ROSE_TRACE_BUILD
+	/* TACIT / L-Trace build (linked against the l_trace spike): enable the per-hart
+	 * trace-encoder commit hook. The l_trace sim_t auto-registers the 0x3000000 encoder
+	 * MMIO block, so a CONFIG_STARTUP_TACIT guest gates capture via TR_TE_CTRL and the
+	 * encoder writes tacit.out/.log/.debug in the CWD. Decode with ltrace-decoder. */
+	s.configure_log(/*enable_log*/false, /*enable_commitlog*/false, /*trace*/true);
+	RDBG("rose_spike_trace: TACIT encoder feed enabled (tacit.out in CWD)\n");
+#endif
 
 	int rc = s.run();
 	for (auto &m : mems) delete m.second;
